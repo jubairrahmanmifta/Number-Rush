@@ -620,6 +620,50 @@ input[type=range]::-moz-range-thumb {
     font-weight: 800;
 }
 
+/* Turn countdown: seconds + a thin progress bar, shown while a turn runs. */
+.timer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.timer-sec {
+    min-width: 2.6em;
+    text-align: right;
+    font-size: .9rem;
+}
+
+.timer-track {
+    position: relative;
+    width: 96px;
+    height: 6px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface);
+}
+
+.timer-fill {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--grad);
+    transition: width .2s linear, background-color .2s ease;
+}
+
+.timer.low .timer-sec,
+.timer.low .timer-fill {
+    color: var(--error);
+}
+
+.timer.low .timer-fill {
+    background: var(--error);
+}
+
 /* ============================================================
    Screen: Home
    ============================================================ */
@@ -1022,6 +1066,16 @@ input[type=range]::-moz-range-thumb {
         font-size: .95rem;
     }
 
+    .timer {
+        justify-content: center;
+        width: 100%;
+    }
+
+    .timer-track {
+        flex: 0 1 140px;
+        width: auto;
+    }
+
     .opts .opt {
         flex: 1 1 42%;
     }
@@ -1041,5 +1095,9 @@ input[type=range]::-moz-range-thumb {
 
     .confetti {
         display: none;
+    }
+
+    .timer-fill {
+        transition: none;
     }
 }

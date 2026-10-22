@@ -11,6 +11,26 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .map(s => s.trim())
   .filter(Boolean);
 
+// Turn timer: seconds = clamp(base + perCircle * n, min, max).
+// The base (and, for tests, the other values) can be overridden via env vars.
+function readNumberEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+const TURN_TIME_BASE_SECONDS = readNumberEnv('TURN_TIME_BASE_SECONDS', 6);
+const TURN_TIME_PER_CIRCLE_SECONDS = readNumberEnv('TURN_TIME_PER_CIRCLE_SECONDS', 2);
+const TURN_TIME_MIN_SECONDS = readNumberEnv('TURN_TIME_MIN_SECONDS', 12);
+const TURN_TIME_MAX_SECONDS = readNumberEnv('TURN_TIME_MAX_SECONDS', 50);
+const WRONG_PICK_DELAY_MS = readNumberEnv('WRONG_PICK_DELAY_MS', 1500);
+
+function turnTimeLimitSeconds(n) {
+  const seconds = TURN_TIME_BASE_SECONDS + TURN_TIME_PER_CIRCLE_SECONDS * n;
+  return Math.max(TURN_TIME_MIN_SECONDS, Math.min(TURN_TIME_MAX_SECONDS, seconds));
+}
+
 const app = express();
 const server = http.createServer(app);
 
@@ -138,6 +158,12 @@ class Room {
     this.flash = null;
     this.locked = false;
     this.wrongTimeout = null;
+    this.turnTimeout = null;
+    this.turnId = 0;
+    this.turnStartedAt = 0;
+    this.timeLimitMs = 0;
+    this.timerRunning = false;
+    this.lastEvent = null;
     this.lastActivity = Date.now();
     this.createdAt = Date.now();
   }
@@ -155,6 +181,7 @@ function createRoom() {
 
 function deleteRoom(room, code) {
   clearWrongTimeout(room);
+  clearTurnTimeout(room);
   // Let any still-connected players know the room is gone.
   room.players.forEach(p => {
     try {
@@ -417,19 +444,19 @@ function applyPick(room, n) {
     if (room.next > room.n) {
       currentPlayer.wins = (currentPlayer.wins || 0) + 1;
       room.phase = 'over';
-      if (room.wrongTimeout) {
-        clearTimeout(room.wrongTimeout);
-        room.wrongTimeout = null;
-      }
+      room.lastEvent = null;
+      clearWrongTimeout(room);
+      clearTurnTimeout(room);
       broadcastRoomState(room);
       return;
     }
   } else {
     room.flash = n;
     room.locked = true;
-    if (room.wrongTimeout) {
-      clearTimeout(room.wrongTimeout);
-    }
+    const currentPlayer = room.players[room.currentPlayerIndex];
+    room.lastEvent = { type: 'wrong', playerName: currentPlayer ? currentPlayer.name : '' };
+    clearTurnTimeout(room); // pause the turn timer during the delay
+    clearWrongTimeout(room);
     room.wrongTimeout = setTimeout(() => {
       room.revealed = [];
       room.flash = null;
@@ -438,11 +465,21 @@ function applyPick(room, n) {
       room.locked = false;
       room.wrongTimeout = null;
       room.lastActivity = Date.now();
+      startTurn(room);
       broadcastRoomState(room);
-    }, 1500);
+    }, WRONG_PICK_DELAY_MS);
+    if (room.wrongTimeout.unref) room.wrongTimeout.unref();
   }
   room.lastActivity = Date.now();
   broadcastRoomState(room);
+}
+
+function restartRound(room, playerId) {
+  if (!room) return { ok: false, error: 'Room not found' };
+  if (room.hostId !== playerId) return { ok: false, error: 'Only the host can restart' };
+  if (room.phase !== 'over') return { ok: false, error: 'Round is not over' };
+  startRound(room);
+  return { ok: true };
 }
 
 function handlePlayAgain(ws, msg) {
@@ -451,22 +488,15 @@ function handlePlayAgain(ws, msg) {
   if (!room) return;
   
   const player = room.players.find(p => p.ws === ws);
-  if (!player || room.hostId !== player.id) {
-    sendError(ws, 'Only the host can restart');
+  if (!player) return;
+
+  const result = restartRound(room, player.id);
+  if (!result.ok) {
+    sendError(ws, result.error);
     return;
   }
-  
+
   room.lastActivity = Date.now();
-  room.phase = 'lobby';
-  room.revealed = [];
-  room.flash = null;
-  room.locked = false;
-  room.currentPlayerIndex = 0;
-  room.next = 1;
-  if (room.wrongTimeout) {
-    clearTimeout(room.wrongTimeout);
-    room.wrongTimeout = null;
-  }
   broadcastRoomState(room);
 }
 
@@ -505,6 +535,7 @@ function removePlayer(room, wsOrId) {
   // Last player left: signal the caller to delete the room and clear timers.
   if (room.players.length === 0) {
     clearWrongTimeout(room);
+    clearTurnTimeout(room);
     return { removed: true, deleted: true, player };
   }
 
@@ -521,6 +552,8 @@ function removePlayer(room, wsOrId) {
       room.phase = 'over';
       room.currentPlayerIndex = 0;
       clearWrongTimeout(room);
+      clearTurnTimeout(room);
+      room.lastEvent = null;
       room.revealed = [];
       room.flash = null;
       room.next = 1;
@@ -545,6 +578,8 @@ function removePlayer(room, wsOrId) {
       room.flash = null;
       room.next = 1;
       room.locked = false;
+      // Whoever is now current gets a fresh timer.
+      startTurn(room);
     }
   } else {
     // Lobby / over: keep the current index point at a valid player.
@@ -566,6 +601,64 @@ function clearWrongTimeout(room) {
     clearTimeout(room.wrongTimeout);
     room.wrongTimeout = null;
   }
+}
+
+function clearTurnTimeout(room) {
+  if (room.turnTimeout) {
+    clearTimeout(room.turnTimeout);
+    room.turnTimeout = null;
+  }
+  room.timerRunning = false;
+}
+
+// Starts a fresh turn: new turnId (so clients can detect the change), full
+// timer, and exactly one pending timeout for the room.
+function startTurn(room) {
+  clearTurnTimeout(room);
+  room.lastEvent = null;
+  if (room.phase !== 'play' || room.players.length === 0) {
+    room.timeLimitMs = 0;
+    return;
+  }
+  room.turnId = (room.turnId || 0) + 1;
+  room.timeLimitMs = Math.round(turnTimeLimitSeconds(room.n) * 1000);
+  room.turnStartedAt = Date.now();
+  room.timerRunning = true;
+  room.turnTimeout = setTimeout(() => handleTurnTimeout(room), room.timeLimitMs);
+  if (room.turnTimeout.unref) room.turnTimeout.unref();
+}
+
+// Time ran out: treat it like a broken sequence. Pause during the same short
+// delay used for wrong picks, then reset and hand the turn to the next player.
+function handleTurnTimeout(room) {
+  room.turnTimeout = null;
+  if (room.phase !== 'play' || room.locked) return;
+  const current = room.players[room.currentPlayerIndex];
+  if (!current) return;
+
+  room.timerRunning = false;
+  room.locked = true;
+  room.flash = null;
+  room.lastEvent = { type: 'timeout', playerName: current.name };
+  room.lastActivity = Date.now();
+  clearWrongTimeout(room);
+  room.wrongTimeout = setTimeout(() => {
+    room.revealed = [];
+    room.flash = null;
+    room.next = 1;
+    room.wrongTimeout = null;
+    if (room.phase !== 'play' || room.players.length === 0) {
+      room.locked = false;
+      return;
+    }
+    room.currentPlayerIndex = (room.currentPlayerIndex + 1) % room.players.length;
+    room.locked = false;
+    room.lastActivity = Date.now();
+    startTurn(room);
+    broadcastRoomState(room);
+  }, WRONG_PICK_DELAY_MS);
+  if (room.wrongTimeout.unref) room.wrongTimeout.unref();
+  broadcastRoomState(room);
 }
 
 // Single shared entry point for leaving: used by the 'leave' message and the
@@ -604,6 +697,8 @@ function generatePlayerId() {
 }
 
 function startRound(room) {
+  clearWrongTimeout(room);
+  clearTurnTimeout(room);
   room.circles = generateCircles(room.n);
   room.revealed = [];
   room.flash = null;
@@ -611,11 +706,9 @@ function startRound(room) {
   room.next = 1;
   room.locked = false;
   room.phase = 'play';
-  if (room.wrongTimeout) {
-    clearTimeout(room.wrongTimeout);
-    room.wrongTimeout = null;
-  }
+  room.lastEvent = null;
   room.lastActivity = Date.now();
+  startTurn(room);
 }
 
 function getRoomState(room, youId) {
@@ -637,6 +730,13 @@ function getRoomState(room, youId) {
     revealed: room.revealed,
     flash: room.flash,
     locked: room.locked,
+    turnId: room.turnId,
+    timeLimitMs: room.timeLimitMs,
+    turnRemainingMs: room.timerRunning
+      ? Math.max(0, room.timeLimitMs - (Date.now() - room.turnStartedAt))
+      : 0,
+    timerRunning: room.timerRunning,
+    lastEvent: room.lastEvent || null,
     youId: youId
   };
 }
@@ -669,7 +769,13 @@ module.exports = {
   generateRoomCode,
   Room,
   removePlayer,
-  clampIndex
+  clampIndex,
+  turnTimeLimitSeconds,
+  startRound,
+  startTurn,
+  handleTurnTimeout,
+  clearTurnTimeout,
+  restartRound
 };
 
 const PORT = process.env.PORT || 3000;

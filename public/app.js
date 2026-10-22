@@ -24,12 +24,73 @@ let localState = {
     best: [],
     wins: [],
     locked: false,
-    round: 0
+    round: 0,
+    turnId: 0,
+    timeLimitMs: 0,
+    turnStartedAt: 0,
+    timerRunning: false,
+    lastEvent: null,
+    turnTimeout: null,
+    wrongTimeout: null
 };
 let onlineState = null;
 let onlineYouId = null;
 
 let playerCount = 2;
+
+// Turn timer. This is the local-mode copy of the server's formula because the
+// local engine is a separate implementation (not shared with the server).
+const TURN_TIME_BASE_SECONDS = 6;
+const TURN_TIME_PER_CIRCLE_SECONDS = 2;
+const TURN_TIME_MIN_SECONDS = 12;
+const TURN_TIME_MAX_SECONDS = 50;
+const WRONG_PICK_DELAY_MS = 1500;
+
+function turnTimeLimitSeconds(n) {
+    const seconds = TURN_TIME_BASE_SECONDS + TURN_TIME_PER_CIRCLE_SECONDS * n;
+    return Math.max(TURN_TIME_MIN_SECONDS, Math.min(TURN_TIME_MAX_SECONDS, seconds));
+}
+
+function vibrateTurn() {
+    try {
+        if ('vibrate' in navigator && typeof navigator.vibrate === 'function') {
+            navigator.vibrate([200, 100, 200]);
+        }
+    } catch (e) {
+        // Unsupported browsers (for example iOS Safari) silently do nothing.
+    }
+}
+
+// Local countdown display. Snapshots arrive every room_state; the bar then
+// counts down against performance.now() until the next sync.
+let displayTimer = { running: false, totalMs: 0, remainingMs: 0, syncedAt: 0 };
+
+function syncTurnTimer(totalMs, remainingMs, running) {
+    displayTimer.totalMs = Math.max(0, Number(totalMs) || 0);
+    displayTimer.remainingMs = Math.max(0, Number(remainingMs) || 0);
+    displayTimer.syncedAt = performance.now();
+    displayTimer.running = !!running && displayTimer.totalMs > 0;
+    updateTurnTimer();
+}
+
+function updateTurnTimer() {
+    const el = $('timer');
+    if (!el) return;
+    if (!displayTimer.running) {
+        el.classList.add('hide');
+        return;
+    }
+    const elapsed = performance.now() - displayTimer.syncedAt;
+    const remaining = Math.max(0, displayTimer.remainingMs - elapsed);
+    const seconds = Math.ceil(remaining / 1000);
+    const percent = Math.max(0, Math.min(1, remaining / displayTimer.totalMs)) * 100;
+    $('timerSec').textContent = seconds + 's';
+    $('timerFill').style.width = percent.toFixed(2) + '%';
+    el.classList.remove('hide');
+    el.classList.toggle('low', remaining <= 5000);
+}
+
+setInterval(updateTurnTimer, 100);
 
 // ----- Theme (presentational only) -----
 function getTheme() {
@@ -96,7 +157,14 @@ function startLocal() {
         best: [],
         wins: [],
         locked: false,
-        round: 0
+        round: 0,
+        turnId: 0,
+        timeLimitMs: 0,
+        turnStartedAt: 0,
+        timerRunning: false,
+        lastEvent: null,
+        turnTimeout: null,
+        wrongTimeout: null
     };
     
     const nick = sanitizeName($('nick').value);
@@ -117,14 +185,86 @@ function startLocal() {
 }
 
 function startLocalRound() {
+    clearLocalTimers();
     localState.circles = generateCirclesLocal(localState.N);
     localState.revealed = [];
     localState.flash = null;
     localState.cur = 0;
     localState.next = 1;
     localState.locked = false;
+    localState.phase = 'play';
+    localState.lastEvent = null;
     localState.round++;
+    startLocalTurn();
     showView('game');
+    render();
+}
+
+function clearLocalTurnTimeout() {
+    if (localState.turnTimeout) {
+        clearTimeout(localState.turnTimeout);
+        localState.turnTimeout = null;
+    }
+    localState.timerRunning = false;
+}
+
+function clearLocalWrongTimeout() {
+    if (localState.wrongTimeout) {
+        clearTimeout(localState.wrongTimeout);
+        localState.wrongTimeout = null;
+    }
+}
+
+function clearLocalTimers() {
+    clearLocalTurnTimeout();
+    clearLocalWrongTimeout();
+}
+
+function localRemainingMs() {
+    if (!localState.timerRunning) return 0;
+    return Math.max(0, localState.timeLimitMs - (performance.now() - localState.turnStartedAt));
+}
+
+// Same behavior as the server: a fresh full timer for every new turn.
+function startLocalTurn() {
+    clearLocalTurnTimeout();
+    localState.lastEvent = null;
+    if (localState.phase !== 'play' || localState.players.length === 0) {
+        localState.timeLimitMs = 0;
+        return;
+    }
+    localState.turnId = (localState.turnId || 0) + 1;
+    localState.timeLimitMs = turnTimeLimitSeconds(localState.N) * 1000;
+    localState.turnStartedAt = performance.now();
+    localState.timerRunning = true;
+    localState.turnTimeout = setTimeout(localTurnTimedOut, localState.timeLimitMs);
+    vibrateTurn();
+}
+
+function localTurnTimedOut() {
+    localState.turnTimeout = null;
+    if (localState.phase !== 'play' || localState.locked) return;
+    const cur = localState.players[localState.cur];
+    localState.timerRunning = false;
+    localState.locked = true;
+    localState.flash = null;
+    localState.lastEvent = { type: 'timeout', playerName: cur ? cur.name : '' };
+    clearLocalWrongTimeout();
+    localState.wrongTimeout = setTimeout(() => {
+        localState.revealed = [];
+        localState.flash = null;
+        localState.next = 1;
+        localState.wrongTimeout = null;
+        if (localState.phase !== 'play' || localState.players.length === 0) {
+            localState.locked = false;
+            render();
+            return;
+        }
+        localState.cur = (localState.cur + 1) % localState.players.length;
+        localState.locked = false;
+        startLocalTurn();
+        render();
+    }, WRONG_PICK_DELAY_MS);
     render();
 }
 
@@ -188,7 +328,11 @@ function renderLocal() {
     renderPlayerBar($('players'), localState.cur, localState.phase === 'play');
     const cur = localState.players[localState.cur];
     if (!cur) return;
-    if (localState.locked && localState.flash) {
+    syncTurnTimer(localState.timeLimitMs, localRemainingMs(),
+        localState.timerRunning && localState.phase === 'play' && !localState.locked);
+    if (localState.locked && localState.lastEvent && localState.lastEvent.type === 'timeout') {
+        setStatus(localState.lastEvent.playerName + ' ran out of time!');
+    } else if (localState.locked && localState.flash) {
         setStatus(cur.name + ' picked ' + localState.flash + ' but needed ' + localState.next + '. Sequence broken!');
     } else if (localState.phase === 'play') {
         setStatus(cur.name + ': find circle', localState.next);
@@ -382,20 +526,27 @@ function applyPickLocal(n) {
             localState.wins[localState.cur] = (localState.wins[localState.cur] || 0) + 1;
             localState.phase = 'over';
             localState.locked = false;
+            localState.lastEvent = null;
+            clearLocalTimers();
             render();
             return;
         }
     } else {
         localState.flash = n;
         localState.locked = true;
-        setTimeout(() => {
+        localState.lastEvent = { type: 'wrong', playerName: localState.players[localState.cur].name };
+        clearLocalTurnTimeout(); // pause the turn timer during the delay
+        clearLocalWrongTimeout();
+        localState.wrongTimeout = setTimeout(() => {
             localState.revealed = [];
             localState.flash = null;
             localState.next = 1;
             localState.cur = (localState.cur + 1) % localState.players.length;
             localState.locked = false;
+            localState.wrongTimeout = null;
+            startLocalTurn();
             render();
-        }, 1500);
+        }, WRONG_PICK_DELAY_MS);
     }
     render();
 }
@@ -489,6 +640,7 @@ function handleMessage(e) {
             // If we're in leaving state, ignore updates
             if (leaving) return;
             const wasInRoom = onlineState && onlineYouId;
+            const prevTurnId = onlineState ? onlineState.turnId : null;
             onlineState = msg;
             onlineYouId = msg.youId;
             
@@ -499,8 +651,18 @@ function handleMessage(e) {
                 showNotice('The room was closed');
                 return;
             }
+
+            // Vibrate only on a real turn change that hands the turn to us.
+            if (prevTurnId != null && typeof msg.turnId === 'number' && msg.turnId !== prevTurnId) {
+                const cur = msg.players[msg.currentPlayerIndex];
+                if (msg.phase === 'play' && msg.timerRunning && cur && cur.id === onlineYouId) {
+                    vibrateTurn();
+                }
+            }
             
             if (onlineState.phase === 'lobby') {
+                syncTurnTimer(0, 0, false);
+                $('over').classList.remove('show');
                 showView('lobby');
                 $('lobCode').textContent = onlineState.code;
                 renderPlayerBar($('lobPlayers'), 0, false, 4);
@@ -539,11 +701,15 @@ function handleMessage(e) {
 function renderOnline() {
     if (!onlineState) return;
     renderPlayerBar($('players'), onlineState.currentPlayerIndex, onlineState.phase === 'play');
+    syncTurnTimer(onlineState.timeLimitMs, onlineState.turnRemainingMs,
+        onlineState.timerRunning && onlineState.phase === 'play' && !onlineState.locked);
     const cur = onlineState.players[onlineState.currentPlayerIndex];
     if (onlineState.phase === 'over') {
         setStatus('Sequence complete!');
     } else if (cur) {
-        if (onlineState.locked && onlineState.flash) {
+        if (onlineState.locked && onlineState.lastEvent && onlineState.lastEvent.type === 'timeout') {
+            setStatus(onlineState.lastEvent.playerName + ' ran out of time!');
+        } else if (onlineState.locked && onlineState.flash) {
             setStatus(cur.name + ' picked ' + onlineState.flash + ' but needed ' + onlineState.next + '. Sequence broken!');
         } else {
             const isMyTurn = onlineYouId && cur.id === onlineYouId;
@@ -640,6 +806,8 @@ function handleLeaveClick() {
 
 function performLeave() {
     leaving = true;
+    clearLocalTimers();
+    syncTurnTimer(0, 0, false);
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;

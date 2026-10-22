@@ -5,8 +5,8 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test/engine.test.js && node test/leave.test.js",
-    "test:files": "node test/engine.test.js && node test/leave.test.js",
+    "test": "node test/engine.test.js && node test/leave.test.js && node test/timer.test.js && node test/timeout.test.js && node test/play-again.test.js",
+    "test:files": "node test/engine.test.js && node test/leave.test.js && node test/timer.test.js && node test/timeout.test.js && node test/play-again.test.js",
     "verify:leave": "node scripts/verify-leave.js"
   },
   "keywords": [
